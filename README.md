@@ -472,6 +472,182 @@ Consulta de um contrato específico:
 curl http://localhost:8080/api/contratos/{id}
 ```
 
+## Implementações Realizadas para o AT
+
+Abaixo está o detalhamento completo de todas as implementações realizadas no projeto para atender aos requisitos do AT.
+
+---
+
+### 1. Comunicação Baseada em Eventos e Publicação Transacional (Transactional Outbox)
+
+* **Publicação Transacional (Transactional Outbox Pattern):**
+  * Para evitar perda de eventos e inconsistência entre o banco de dados relacional e o Kafka (problema de *Dual-Write*), o `contrato-service` utiliza a tabela `outbox_events`.
+  * Toda mutação de estado no Aggregate `Contrato` (`ContratoCriado`, `EntregaRegistrada`, `ContratoConcluido`, `ContratoCancelado`) é persistida atomicamente na mesma transação `@Transactional` do banco `contrato_db`.
+  * Um método assíncrono com `@Scheduled` (`OutboxPublisher`) consulta periodicamente os registros com status `PENDENTE`, publica as mensagens no Kafka via `ContratoProducer` e atualiza o status do outbox para `PUBLICADO`.
+* **Desacoplamento:**
+  * Não há chamadas HTTP diretas síncronas entre o `contrato-service` e os serviços auxiliares. Toda a integração é orientada a eventos via Kafka.
+
+---
+
+### 2. Integração dos Serviços Consumidores
+
+Os serviços auxiliares reagem de forma autônoma aos eventos consumidos do tópico Kafka:
+
+* **`notificacao-service` (`NotificacaoKafkaConsumer`):**
+  * Consome o tópico `contratos.eventos` sob o consumer group `notificacao-group`.
+  * Reage a todos os ciclos de vida do contrato, gerando notificações para as partes envolvidas:
+    * `ContratoCriado` $\rightarrow$ notifica o Freelancer.
+    * `EntregaRegistrada` $\rightarrow$ notifica o Cliente para validação da entrega.
+    * `ContratoConcluido` $\rightarrow$ notifica o Freelancer sobre a conclusão do trabalho.
+    * `ContratoCancelado` $\rightarrow$ notifica o Freelancer sobre o cancelamento.
+* **`reputacao-service` (`ReputacaoKafkaConsumer`):**
+  * Consome o tópico `contratos.eventos` sob o consumer group `reputacao-group`.
+  * Reage ao evento `ContratoConcluido`, atualizando incrementalmente no `reputacao_db` o número de contratos concluídos e o valor financeiro total acumulado pelo freelancer.
+* **`auditoria-service` (`AuditoriaKafkaConsumer`):**
+  * Consome o tópico `contratos.eventos` sob o consumer group `auditoria-group`.
+  * Registra imutavelmente todos os eventos recebidos no `auditoria_db`, armazenando `eventId`, `aggregateId`, `eventType`, `correlationId`, `payload` JSON completo e timestamp de recebimento.
+
+---
+
+### 3. Especificação das Mensagens e Contratos de Eventos
+
+* **Tópico Principal:** `contratos.eventos`
+* **Produtor:** `contrato-service`
+* **Consumidores:** `notificacao-service`, `reputacao-service`, `auditoria-service`
+* **Chave de Publicação (Partition Key):** `contratoId` (UUID do contrato em formato String).
+
+#### Estrutura do Payload (`ContratoEventoDTO`):
+
+| Campo | Tipo | Obrigatório | Descrição |
+|---|---|---|---|
+| `eventId` | `UUID` | Sim | Identificador único global do evento para idempotência |
+| `tipoEvento` | `String` | Sim | Nome do evento (`ContratoCriado`, `EntregaRegistrada`, `ContratoConcluido`, `ContratoCancelado`) |
+| `contratoId` | `UUID` | Sim | Identificador único do contrato (Aggregate ID) |
+| `occurredOn` | `Instant` | Sim | Data e hora UTC em que o evento ocorreu |
+| `correlationId` | `String` | Sim | Identificador de correlação ponta a ponta da operação |
+| `clienteId` | `UUID` | Condicional | Identificador do cliente contratante |
+| `freelancerId` | `UUID` | Condicional | Identificador do freelancer contratado |
+| `titulo` | `String` | Condicional | Título descritivo do contrato de trabalho |
+| `valor` | `BigDecimal` | Condicional | Valor financeiro acordado no contrato |
+| `novoStatus` | `String` | Não | Novo status assumido pelo contrato |
+
+#### Exemplo de Mensagem JSON (`ContratoCriado`):
+
+```json
+{
+  "eventId": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+  "tipoEvento": "ContratoCriado",
+  "contratoId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "occurredOn": "2026-10-01T20:00:00Z",
+  "correlationId": "req-corr-98765",
+  "clienteId": "11111111-1111-1111-1111-111111111111",
+  "freelancerId": "22222222-2222-2222-2222-222222222222",
+  "titulo": "Desenvolvimento de Microsserviços",
+  "valor": 4500.00,
+  "novoStatus": "ATIVO"
+}
+```
+
+---
+
+### 4. Processamento Concorrente e Garantia de Ordenação
+
+* **Estratégia de Particionamento:**
+  * O `ContratoProducer` envia explicitamente o `contratoId.toString()` como a **chave da mensagem Kafka**.
+  * O algoritmo do Kafka garante que todas as mensagens com a mesma ch ave sejam encaminhadas para a **mesma partição**.
+* **Preservação da Ordem por Contrato:**
+  * Dentro de uma mesma partição do Kafka, a ordem estrita dos registros é preservada.
+  * O ciclo de vida (`ContratoCriado` $\rightarrow$ `EntregaRegistrada` $\rightarrow$ `ContratoConcluido`) é processado na sequência correta para um mesmo contrato.
+* **Processamento:**
+  * Contratos distintos possuem chaves diferentes, sendo distribuídos entre diferentes partições do tópico, o que permite o consumo paralelo entre múltiplas instâncias ou consumidores.
+
+---
+
+### 5. Tratamento de Mensagens Duplicadas e Idempotência
+
+* **Padrão de Idempotência (Tabela de Eventos Processados):**
+  * Os serviços consumidores (`notificacao-service`, `reputacao-service` e `auditoria-service`) possuem controle de idempotência baseado no identificador único do evento (`eventId`).
+  * Antes de executar a regra de negócio, o serviço verifica se o `eventId` já existe na tabela `eventos_processados` (ou registro de auditoria).
+  * Caso já exista:
+    * O processamento é abortado.
+    * Um log de aviso no formato `[servico].evento.duplicado.ignorado eventId=... contratoId=...` é registrado.
+  * Caso não exista:
+    * A operação de negócio é executada e o `eventId` é persistido na tabela `eventos_processados`.
+
+---
+
+### 6. Logs Padronizados da Aplicação
+
+* Todos os microsserviços implementam logging contextual e estruturado utilizando SLF4J / Logback:
+  * Início de requisições HTTP e consumo de eventos: `[fluxo].inicio`
+  * Sucesso nas etapas de negócio e persistência: `[fluxo].sucesso`
+  * Erros e exceções tratadas: `[fluxo].erro`
+  * Detecção de duplicidades: `[fluxo].duplicado.ignorado`
+* **Campos Obrigatórios nos Logs:**
+  * `service`: Nome do microsserviço emissor.
+  * `correlationId`: Identificador da transação ponta a ponta (injetado via `MDC`).
+  * `contratoId` / `aggregateId`: Identificador do contrato.
+  * `eventId`: Identificador do evento.
+  * `tipoEvento`: Nome do evento de domínio.
+
+---
+
+### 7. Centralização de Logs (Graylog)
+
+* **Arquitetura de Observabilidade de Logs:**
+  * O Docker Compose inclui o **Graylog**, integrado com **OpenSearch** e **MongoDB**.
+  * Cada microsserviço Spring Boot utiliza a biblioteca `logback-gelf` para streaming automático de logs via protocolo GELF UDP/TCP na porta `12201`.
+* **Consulta Unificada:**
+  * É possível pesquisar todas as mensagens correlacionadas de múltiplos serviços na interface do Graylog (`http://localhost:9000`) utilizando consultas.
+---
+
+### 8. Rastreamento Distribuído (Distributed Tracing com Zipkin)
+
+* **Micrometer Tracing & OpenTelemetry/Brave:**
+  * Cada aplicação possui as dependências do `spring-boot-starter-actuator` e `micrometer-tracing-bridge-brave` configuradas para exportação ao **Zipkin** (`http://localhost:9411`).
+* **Propagação de Contexto:**
+  * O contexto do trace (`traceId`, `spanId`) é propagado tanto nas chamadas HTTP via API Gateway quanto através dos cabeçalhos dos registros do Kafka.
+  * A interface do Zipkin permite visualizar o histórico de spans completo da transação, demonstrando o tempo gasto em cada serviço e a passagem pelo Kafka.
+
+---
+
+### 9. Correlação das Operações Ponta a Ponta
+
+A rastreabilidade completa de uma operação é mantida através do identificador de correlação:
+
+```text
+API Gateway (RequestLoggingFilter: gera ou repassa X-Correlation-Id)
+    ↓ [HTTP Header]
+contrato-service (ContratoController: recebe header e alimenta MDC)
+    ↓ [Transação / Outbox]
+contrato_db (Tabela outbox_events armazena correlationId no payload)
+    ↓ [Assíncrono: OutboxPublisher]
+Kafka (Mensagem publicada no tópico contratos.eventos)
+    ↓ [Consumo de Mensagens]
+serviços consumidores (Auditoria, Notificacao, Reputacao: extraem correlationId e alimentam MDC)
+```
+---
+
+### 10. Tratamento de Falhas e Resiliência
+
+* **Isolamento de Erros:**
+  * O consumo de cada mensagem possui blocos estruturados de tratamento de exceções. Falhas no processamento de mensagens individuais são capturadas e registradas com nível `ERROR`, preservando o contexto e o identificador do evento.
+---
+
+### 11. Infraestrutura Completa (Docker Compose)
+
+O arquivo `infra/docker-compose.yml` provê toda a stack necessária em containers orquestrados:
+
+* **PostgreSQL 16:** Bancos dedicados `contrato_db`, `notificacao_db`, `reputacao_db` e `auditoria_db` (porta `5432`).
+* **Apache Kafka 4.2 (KRaft Mode):** Broker de mensageria sem dependência do ZooKeeper (porta `9092` externa, `19092` interna).
+* **Kafka UI:** Interface gráfica para inspeção de tópicos, partições e mensagens (porta `8090`).
+* **OpenSearch 2.13:** Mecanismo de busca e armazenamento de logs indexados (porta `9200`).
+* **MongoDB 6.0:** Banco de metadados e configurações do Graylog (porta `27017`).
+* **Graylog 6.0:** Painel de centralização e busca de logs via GELF (porta `9000` web, `12201` GELF).
+* **Zipkin:** Coletor e visualizador de traces distribuídos (porta `9411`).
+
+---
+
 ## Tecnologias
 
 ```text

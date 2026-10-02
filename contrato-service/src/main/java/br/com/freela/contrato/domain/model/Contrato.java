@@ -1,6 +1,9 @@
 package br.com.freela.contrato.domain.model;
 
+import br.com.freela.contrato.domain.event.ContratoCancelado;
+import br.com.freela.contrato.domain.event.ContratoConcluido;
 import br.com.freela.contrato.domain.event.ContratoCriado;
+import br.com.freela.contrato.domain.event.EntregaRegistrada;
 import br.com.freela.contrato.domain.shared.DomainEvent;
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -43,18 +46,27 @@ public class Contrato {
     public void registrarEntrega() {
         if (status != StatusContrato.ATIVO) throw new IllegalStateException("Somente contratos ativos recebem entrega");
         status = StatusContrato.ENTREGA_REGISTRADA;
+        this.domainEvents.add(EntregaRegistrada.novo(this));
     }
+
     public void concluir() {
         if (status != StatusContrato.ENTREGA_REGISTRADA) throw new IllegalStateException("A entrega precisa estar registrada");
         status = StatusContrato.CONCLUIDO;
+        this.domainEvents.add(ContratoConcluido.novo(this));
     }
+
     public void cancelar() {
         if (status == StatusContrato.CONCLUIDO) throw new IllegalStateException("Contrato concluído não pode ser cancelado");
         status = StatusContrato.CANCELADO;
+        this.domainEvents.add(ContratoCancelado.novo(this));
     }
+
     public List<DomainEvent> pullDomainEvents() {
-        var copy = List.copyOf(domainEvents); domainEvents.clear(); return copy;
+        var copy = List.copyOf(domainEvents);
+        domainEvents.clear();
+        return copy;
     }
+
     public List<DomainEvent> domainEvents() { return Collections.unmodifiableList(domainEvents); }
     public UUID id(){return id;} public UUID clienteId(){return clienteId;} public UUID freelancerId(){return freelancerId;}
     public String titulo(){return titulo;} public BigDecimal valor(){return valor;} public StatusContrato status(){return status;}
