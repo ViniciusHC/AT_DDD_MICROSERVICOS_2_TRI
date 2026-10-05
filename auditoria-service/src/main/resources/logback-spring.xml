@@ -11,7 +11,7 @@
         </encoder>
     </appender>
 
-    <appender name="GELF" class="de.siegmar.logbackgelf.GelfUdpAppender">
+    <appender name="GELF" class="de.siegmar.logbackgelf.GelfTcpAppender">
         <graylogHost>localhost</graylogHost>
         <graylogPort>12201</graylogPort>
         <encoder class="de.siegmar.logbackgelf.GelfEncoder">
